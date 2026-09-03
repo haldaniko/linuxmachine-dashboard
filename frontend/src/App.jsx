@@ -21,8 +21,14 @@ import {
   X,
 } from "lucide-react";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
+const APP_BASE_PATH = import.meta.env.BASE_URL || "/";
+const APP_BASE_PREFIX = APP_BASE_PATH === "/" ? "" : APP_BASE_PATH.replace(/\/$/, "");
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || `${APP_BASE_PREFIX}/api`;
 const AUTH_TOKEN_KEY = "soc_control_token";
+
+function publicAssetUrl(path) {
+  return `${APP_BASE_PREFIX}${path.startsWith("/") ? path : `/${path}`}`;
+}
 
 function getAuthToken() {
   return localStorage.getItem(AUTH_TOKEN_KEY);
@@ -2300,7 +2306,7 @@ function App() {
               <X size={18} />
             </button>
             {infoModal === "project" ? (
-              <img className="project-poster" src="/Plakat-Plameli-Digi.jpg" alt="Проект BG16RFPR001-1.012-0189-C01" />
+              <img className="project-poster" src={publicAssetUrl("/Plakat-Plameli-Digi.jpg")} alt="Проект BG16RFPR001-1.012-0189-C01" />
             ) : (
               <div className="license-content">
                 <h2>Лиценз NET Base 03.022<br />03-022-0134</h2>
