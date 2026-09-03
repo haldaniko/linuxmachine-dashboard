@@ -1,0 +1,43 @@
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / frontend builds
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+build/
+.vite/
+
+# Local tooling and OS files
+.tmp_pydeps/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime/generated files
+media/
+staticfiles/
+*.log
+
+# SQLite scratch databases
+*.sqlite3
+data/
+backend/db.sqlite3
+
+# Keep the requested seeded SQLite database in the repository.
+!backend/data/
+!backend/data/db.sqlite3

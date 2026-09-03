@@ -1,0 +1,110 @@
+import django.db.models.deletion
+import django.utils.timezone
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+    dependencies = [
+        ("api", "0005_suricata_ips_models"),
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name="EDREndpoint",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("external_id", models.CharField(blank=True, max_length=120)),
+                ("hostname", models.CharField(max_length=160)),
+                ("ip", models.GenericIPAddressField(default="0.0.0.0")),
+                ("os", models.CharField(blank=True, max_length=120)),
+                ("os_version", models.CharField(blank=True, max_length=120)),
+                ("architecture", models.CharField(blank=True, max_length=40)),
+                ("agent_version", models.CharField(blank=True, max_length=80)),
+                ("agent_id", models.CharField(blank=True, max_length=120)),
+                ("status", models.CharField(choices=[("online", "Online"), ("offline", "Offline"), ("never_connected", "Never connected"), ("error", "Error")], default="never_connected", max_length=24)),
+                ("security_status", models.CharField(choices=[("protected", "Protected"), ("attention", "Attention"), ("at_risk", "At risk"), ("critical", "Critical")], default="protected", max_length=24)),
+                ("provider", models.CharField(default="wazuh", max_length=40)),
+                ("logged_in_user", models.CharField(blank=True, max_length=140)),
+                ("last_seen", models.DateTimeField(blank=True, null=True)),
+                ("first_seen", models.DateTimeField(default=django.utils.timezone.now)),
+                ("created_at", models.DateTimeField(default=django.utils.timezone.now)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+            ],
+            options={"ordering": ["hostname"]},
+        ),
+        migrations.CreateModel(
+            name="EDREnrollmentToken",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("token", models.CharField(max_length=80, unique=True)),
+                ("platform", models.CharField(max_length=24)),
+                ("manager_url", models.CharField(max_length=240)),
+                ("expires_at", models.DateTimeField()),
+                ("used", models.BooleanField(default=False)),
+                ("created_at", models.DateTimeField(default=django.utils.timezone.now)),
+            ],
+            options={"ordering": ["-created_at"]},
+        ),
+        migrations.CreateModel(
+            name="EDREvent",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("timestamp", models.DateTimeField(default=django.utils.timezone.now)),
+                ("event_type", models.CharField(max_length=120)),
+                ("category", models.CharField(max_length=80)),
+                ("severity", models.CharField(choices=[("informational", "Informational"), ("low", "Low"), ("medium", "Medium"), ("high", "High"), ("critical", "Critical")], default="low", max_length=16)),
+                ("title", models.CharField(max_length=240)),
+                ("description", models.TextField(blank=True)),
+                ("process_name", models.CharField(blank=True, max_length=160)),
+                ("process_path", models.CharField(blank=True, max_length=500)),
+                ("process_id", models.CharField(blank=True, max_length=40)),
+                ("parent_process", models.CharField(blank=True, max_length=160)),
+                ("username", models.CharField(blank=True, max_length=140)),
+                ("source_ip", models.GenericIPAddressField(blank=True, null=True)),
+                ("destination_ip", models.GenericIPAddressField(blank=True, null=True)),
+                ("source_port", models.PositiveIntegerField(blank=True, null=True)),
+                ("destination_port", models.PositiveIntegerField(blank=True, null=True)),
+                ("protocol", models.CharField(blank=True, max_length=24)),
+                ("file_path", models.CharField(blank=True, max_length=500)),
+                ("file_hash", models.CharField(blank=True, max_length=160)),
+                ("action", models.CharField(default="alert", max_length=80)),
+                ("rule_id", models.CharField(blank=True, max_length=120)),
+                ("source", models.CharField(default="wazuh", max_length=40)),
+                ("raw_event", models.JSONField(blank=True, default=dict)),
+                ("created_at", models.DateTimeField(default=django.utils.timezone.now)),
+                ("endpoint", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="events", to="api.edrendpoint")),
+            ],
+            options={"ordering": ["-timestamp"]},
+        ),
+        migrations.CreateModel(
+            name="EDRThreat",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("title", models.CharField(max_length=240)),
+                ("category", models.CharField(max_length=80)),
+                ("severity", models.CharField(choices=[("informational", "Informational"), ("low", "Low"), ("medium", "Medium"), ("high", "High"), ("critical", "Critical")], default="low", max_length=16)),
+                ("status", models.CharField(choices=[("new", "New"), ("investigating", "Investigating"), ("resolved", "Resolved"), ("ignored", "Ignored"), ("blocked", "Blocked")], default="new", max_length=24)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+                ("created_at", models.DateTimeField(default=django.utils.timezone.now)),
+                ("endpoint", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="threats", to="api.edrendpoint")),
+                ("event", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="threats", to="api.edrevent")),
+            ],
+            options={"ordering": ["-created_at"]},
+        ),
+        migrations.CreateModel(
+            name="EDRVulnerability",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("cve", models.CharField(max_length=40)),
+                ("package", models.CharField(blank=True, max_length=160)),
+                ("installed_version", models.CharField(blank=True, max_length=120)),
+                ("fixed_version", models.CharField(blank=True, max_length=120)),
+                ("severity", models.CharField(choices=[("informational", "Informational"), ("low", "Low"), ("medium", "Medium"), ("high", "High"), ("critical", "Critical")], default="low", max_length=16)),
+                ("status", models.CharField(default="open", max_length=40)),
+                ("created_at", models.DateTimeField(default=django.utils.timezone.now)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+                ("endpoint", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="vulnerabilities", to="api.edrendpoint")),
+            ],
+            options={"ordering": ["-created_at"], "unique_together": {("endpoint", "cve", "package")}},
+        ),
+    ]

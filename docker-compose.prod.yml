@@ -1,0 +1,44 @@
+services:
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest-debian
+    environment:
+      COLLECTIONS: crowdsecurity/nginx crowdsecurity/linux
+      DISABLE_ONLINE_API: "true"
+      METRICS_PORT: "6060"
+    volumes:
+      - crowdsec_config:/etc/crowdsec
+      - crowdsec_data:/var/lib/crowdsec/data
+
+  backend:
+    build:
+      context: ./backend
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-change-me-in-production}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      SQLITE_DB_PATH: /app/data/db.sqlite3
+      CROWDSEC_METRICS_URL: http://crowdsec:6060/metrics
+    volumes:
+      - sqlite_data:/app/data
+      - crowdsec_config:/etc/crowdsec:ro
+    depends_on:
+      - crowdsec
+    command: sh -c "python manage.py migrate && python manage.py bootstrap_runtime && gunicorn security_platform.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 60"
+
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile.prod
+    ports:
+      - "8050:80"
+    depends_on:
+      - backend
+
+volumes:
+  sqlite_data:
+  crowdsec_config:
+  crowdsec_data:
