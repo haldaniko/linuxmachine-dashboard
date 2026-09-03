@@ -18,7 +18,7 @@ services:
     environment:
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-change-me-in-production}
       DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
-      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,frontend,backend}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       SQLITE_DB_PATH: /app/data/db.sqlite3
       CROWDSEC_METRICS_URL: http://crowdsec:6060/metrics
@@ -29,12 +29,12 @@ services:
       - crowdsec
     command: sh -c "python manage.py migrate && python manage.py bootstrap_runtime && gunicorn security_platform.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 60"
 
-  nginx:
+  frontend:
     build:
-      context: .
-      dockerfile: nginx/Dockerfile.prod
+      context: ./frontend
+      target: prod
     ports:
-      - "8050:80"
+      - "8050:8050"
     depends_on:
       - backend
 

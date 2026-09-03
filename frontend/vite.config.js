@@ -6,5 +6,17 @@ export default defineConfig({
   server: {
     allowedHosts: true,
   },
+  preview: {
+    allowedHosts: true,
+    proxy: {
+      "/api": {
+        target: "http://backend:8000",
+        changeOrigin: true,
+      },
+      "/admin": {
+        target: "http://backend:8000",
+        changeOrigin: true,
+      },
+    },
+  },
 });
-
