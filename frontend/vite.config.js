@@ -30,6 +30,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     allowedHosts: true,
+    proxy,
   },
   preview: {
     allowedHosts: true,
