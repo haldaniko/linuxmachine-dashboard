@@ -1911,7 +1911,7 @@ function SIEMPage({ data, actions }) {
         </div>
         <form className="form-grid" onSubmit={saveSource}>
           <Field label="Название источника">
-            <TextInput value={source.name} onChange={(value) => setSource((current) => ({ ...current, name: value }))} placeholder="Например: edge-nginx" />
+            <TextInput value={source.name} onChange={(value) => setSource((current) => ({ ...current, name: value }))} placeholder="Например: edge-proxy" />
           </Field>
           <Field label="Откуда приходят данные">
             <ModuleSelect value={source.component} onChange={(value) => setSource((current) => ({ ...current, component: value }))} />

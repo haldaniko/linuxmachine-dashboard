@@ -2,7 +2,7 @@ services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest-debian
     environment:
-      COLLECTIONS: crowdsecurity/nginx crowdsecurity/linux
+      COLLECTIONS: crowdsecurity/linux
       DISABLE_ONLINE_API: "true"
       METRICS_PORT: "6060"
     volumes:

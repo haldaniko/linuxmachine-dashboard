@@ -9,7 +9,7 @@
 docker compose up --build
 ```
 
-Интерфейс будет доступен на `http://localhost:8050`.
+Интерфейс будет доступен на `http://localhost:5173`.
 
 Dev-сборка использует SQLite в Docker volume `sqlite_data`.
 
@@ -21,7 +21,7 @@ docker compose -f docker-compose.prod.yml up --build -d
 
 Production-сборка тоже использует SQLite в Docker volume `sqlite_data`, поэтому `DATABASE_URL` в `.env` не нужен.
 Наружный порт также `8050`; frontend-контейнер отдаёт собранный React и проксирует `/api` во внутренний backend.
-Этот порт можно проксировать внешним nginx на нужный домен.
+Пример внешнего reverse proxy находится в `.nginx.sample`.
 
 Опционально можно создать `.env` только для секретов и доменов:
 
@@ -79,5 +79,5 @@ curl -X POST http://localhost:8050/api/edr/telemetry/ \
 ```bash
 curl -X POST http://localhost:8050/api/ingest/logs/ \
   -H "Content-Type: application/json" \
-  -d '{"source":"nginx-edge","component":"siem","source_ip":"10.1.2.8","event_type":"Auth failed","severity":"medium","raw_message":"failed login"}'
+  -d '{"source":"edge-proxy","component":"siem","source_ip":"10.1.2.8","event_type":"Auth failed","severity":"medium","raw_message":"failed login"}'
 ```
