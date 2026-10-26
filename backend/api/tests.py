@@ -1,7 +1,9 @@
 from datetime import timedelta
+from io import StringIO
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.core.management import call_command
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
@@ -10,8 +12,8 @@ from rest_framework.test import APIClient
 from .firewall_service import apply_firewall_rules, build_nft_config, rule_to_nft
 from .models import (
     AccessControlRule, EDREndpoint, EDREvent, EDRThreat, EDRVulnerability,
-    FirewallRule, IPSCustomRule, IPSRule, ModuleSetting, SecurityComponent,
-    SecurityEvent, WebFilterRule,
+    FirewallRule, IPSAlert, IPSCustomRule, IPSRule, LogEntry, ModuleSetting,
+    SecurityComponent, SecurityEvent, WebFilterRule,
 )
 from .serializers import FirewallRuleSerializer, ModuleSettingSerializer, WebFilterRuleSerializer
 from .views import evaluate_access_payload, evaluate_firewall_payload, evaluate_web_payload, inspect_ips_payload
@@ -249,3 +251,27 @@ class SecurityConfigurationTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.client.force_authenticate(user)
         self.assertEqual(self.client.patch(f"/api/auth/users/{self.admin.pk}/", {"email": "test@example.com"}, format="json").status_code, 403)
+
+
+class LedgerLabSeedTests(TestCase):
+    def test_seed_is_idempotent_and_uses_operational_company_data(self):
+        output = StringIO()
+        call_command("seed_mock_data", stdout=output)
+        call_command("seed_mock_data", stdout=output)
+
+        self.assertEqual(FirewallRule.objects.filter(name="Public client portal HTTPS").count(), 1)
+        self.assertEqual(SecurityEvent.objects.filter(extra_data__seed="ledgerlab-accounting-v1").count(), 8)
+        self.assertEqual(IPSAlert.objects.filter(raw_event__seed="ledgerlab-accounting-v1").count(), 4)
+        self.assertEqual(LogEntry.objects.filter(parsed__seed="ledgerlab-accounting-v1").count(), 8)
+        self.assertEqual(EDREndpoint.objects.filter(external_id__startswith="ledgerlab-").count(), 12)
+
+        seeded_users = User.objects.filter(
+            username__in=["security.admin", "it.operations", "compliance.viewer", "accounting.lead", "payroll.lead"]
+        )
+        self.assertEqual(seeded_users.count(), 5)
+        self.assertFalse(seeded_users.exclude(email__endswith="@ledgerlab.tech").exists())
+
+        narrative = " ".join(SecurityEvent.objects.values_list("message", flat=True)).lower()
+        signatures = " ".join(IPSAlert.objects.values_list("signature", flat=True)).lower()
+        for unwanted in ["brute force", "sql injection", "trojan", "ransomware", "nmap"]:
+            self.assertNotIn(unwanted, narrative + signatures)
