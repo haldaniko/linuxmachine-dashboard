@@ -1,5 +1,6 @@
 import ipaddress
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -7,6 +8,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.utils import timezone
+from .configuration import IPSSettingsSerializer
 
 from .models import IPSCustomRule, IPSRuleCategory, IPSUpdateLog, ModuleSetting, SecurityComponent
 
@@ -96,14 +98,21 @@ def write_custom_rules():
 def validate_custom_rule(raw_rule, sid):
     if int(sid) < 1000000:
         raise ValueError("Пользовательские SID должны быть 1000000 или выше")
-    if f"sid:{sid}" not in raw_rule.replace(" ", ""):
+    if not re.search(rf"\bsid\s*:\s*{int(sid)}\s*;", raw_rule):
         raise ValueError("Raw rule должен содержать указанный SID")
+    if len([line for line in raw_rule.strip().splitlines() if line.strip()]) != 1:
+        raise ValueError("Въведете точно едно правило на един ред.")
+    if not re.match(r"^(alert|drop|reject|rejectsrc|rejectdst|rejectboth|pass)\s+[a-z][a-z0-9_]*\s+", raw_rule.strip()):
+        raise ValueError("Правилото трябва да започва с валидно действие и протокол на Suricata.")
     if not raw_rule.strip().endswith(")"):
         raise ValueError("Правило Suricata должно завершаться закрывающей скобкой")
     return True
 
 
 def apply_settings(payload):
+    serializer = IPSSettingsSerializer(data=payload)
+    serializer.is_valid(raise_exception=True)
+    payload = serializer.validated_data
     setting = get_ips_setting()
     current = setting.settings or {}
     new_settings = {

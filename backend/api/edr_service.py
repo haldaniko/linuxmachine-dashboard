@@ -3,6 +3,7 @@ import secrets
 from datetime import timedelta
 
 from django.utils import timezone
+from django.db.models import Case, F, Value, When
 
 from .models import (
     EDREndpoint,
@@ -17,6 +18,20 @@ from .models import (
 
 
 THREAT_CATEGORIES = {"malware", "suspicious_process", "network_attack", "policy_violation", "rootkit"}
+
+
+def with_effective_status(queryset):
+    settings = get_edr_setting().settings or {}
+    try:
+        minutes = max(1, int(settings.get("agent_offline_timeout_minutes", 15)))
+    except (TypeError, ValueError):
+        minutes = 15
+    cutoff = timezone.now() - timedelta(minutes=minutes)
+    return queryset.annotate(effective_status=Case(
+        When(status="online", last_seen__isnull=True, then=Value("never_connected")),
+        When(status="online", last_seen__lt=cutoff, then=Value("offline")),
+        default=F("status"),
+    ))
 
 
 def get_edr_setting():

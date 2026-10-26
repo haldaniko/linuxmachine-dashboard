@@ -1,4 +1,6 @@
 import ipaddress
+import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -57,11 +59,18 @@ def validate_rule(rule):
         raise ValueError("Направление должно быть Incoming или Outgoing")
     if rule.protocol not in {"any", "tcp", "udp", "icmp"}:
         raise ValueError("Протокол должен быть Any, TCP, UDP или ICMP")
+    if rule.protocol not in {"tcp", "udp"} and any(normalize_any(port) for port in [getattr(rule, "source_port", "any"), rule.destination_port]):
+        raise ValueError("Изберете TCP или UDP, когато задавате конкретен порт.")
+    source, destination = normalize_any(rule.source_cidr), normalize_any(rule.destination_cidr)
+    if source and destination and ipaddress.ip_network(source, strict=False).version != ipaddress.ip_network(destination, strict=False).version:
+        raise ValueError("Източникът и дестинацията трябва да използват еднаква IP версия.")
 
 
-def nft_action(action):
+def nft_action(action, monitor=False, log_allowed=False):
+    if monitor and action in BLOCKING_ACTIONS:
+        return 'log prefix "security_platform monitor " accept'
     if action == "allow":
-        return "accept"
+        return 'log prefix "security_platform allow " accept' if log_allowed else "accept"
     if action == "reject":
         return "reject"
     if action == "log":
@@ -85,11 +94,13 @@ def port_fragment(field, value, protocol):
     return f"{protocol} {field} {int(value)}"
 
 
-def rule_to_nft(rule):
+def rule_to_nft(rule, monitor=False, log_allowed=False):
     validate_rule(rule)
     parts = []
     if rule.protocol == "icmp":
-        parts.append("ip protocol icmp")
+        parts.append("meta l4proto { icmp, ipv6-icmp }")
+    elif rule.protocol in {"tcp", "udp"}:
+        parts.append(f"meta l4proto {rule.protocol}")
     parts.extend(
         fragment
         for fragment in [
@@ -100,20 +111,30 @@ def rule_to_nft(rule):
         ]
         if fragment
     )
-    comment = f'comment "{rule.name[:64].replace(chr(34), "")}"'
-    return " ".join([*parts, "counter", nft_action(rule.action), comment]).strip()
+    comment = f"comment {json.dumps(rule.name[:64], ensure_ascii=False)}"
+    return " ".join([*parts, "counter", nft_action(rule.action, monitor=monitor, log_allowed=log_allowed), comment]).strip()
 
 
-def build_nft_config(rules, firewall_enabled=True):
+def build_nft_config(rules, firewall_enabled=True, mode="enforce", default_action="allow", log_allowed=False):
+    if mode not in {"monitor", "enforce", "disabled"}:
+        raise ValueError("Невалиден режим на защитната стена.")
+    if default_action not in {"allow", "block", "reject", "log"}:
+        raise ValueError("Невалидно действие по подразбиране.")
+    active = firewall_enabled and mode != "disabled"
     input_rules = []
     output_rules = []
-    if firewall_enabled:
+    if active:
         for rule in rules:
-            rendered = rule_to_nft(rule)
+            rendered = rule_to_nft(rule, monitor=mode == "monitor", log_allowed=log_allowed)
             if rule.direction in {"inbound", "any"}:
                 input_rules.append(rendered)
             if rule.direction in {"outbound", "any"}:
                 output_rules.append(rendered)
+
+        # An explicit terminal rule preserves reject and optional logging behavior.
+        default_rule = f"counter {nft_action(default_action, monitor=mode == 'monitor', log_allowed=log_allowed)}"
+        input_rules.append(default_rule)
+        output_rules.append(default_rule)
 
     def chain(name, rows):
         body = "\n".join(f"        {row}" for row in rows)
@@ -194,25 +215,33 @@ def apply_nft_config(config):
         handle.write(config)
         config_path = handle.name
 
-    check = subprocess.run([nft_path, "-c", "-f", config_path], capture_output=True, text=True, timeout=15)
-    if check.returncode != 0:
-        return False, check.stderr.strip() or check.stdout.strip() or "nftables отклонил конфигурацию"
+    try:
+        check = subprocess.run([nft_path, "-c", "-f", config_path], capture_output=True, text=True, timeout=15)
+        if check.returncode != 0:
+            return False, check.stderr.strip() or check.stdout.strip() or "nftables отклонил конфигурацию"
+        apply = subprocess.run([nft_path, "-f", config_path], capture_output=True, text=True, timeout=15)
+        if apply.returncode != 0:
+            return False, apply.stderr.strip() or apply.stdout.strip() or "nftables не смог применить конфигурацию"
+        return True, "Правила успешно применены"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"nftables не отговори успешно: {exc}"
+    finally:
+        os.unlink(config_path)
 
-    apply = subprocess.run([nft_path, "-f", config_path], capture_output=True, text=True, timeout=15)
-    if apply.returncode != 0:
-        return False, apply.stderr.strip() or apply.stdout.strip() or "nftables не смог применить конфигурацию"
-    return True, "Правила успешно применены"
 
-
-def apply_firewall_rules(request, rules, firewall_enabled=True):
+def apply_firewall_rules(request, rules, firewall_enabled=True, mode="enforce", default_action="allow", log_allowed=False):
     rules = list(rules)
     try:
-        config = build_nft_config(rules, firewall_enabled=firewall_enabled)
+        config = build_nft_config(rules, firewall_enabled=firewall_enabled, mode=mode, default_action=default_action, log_allowed=log_allowed)
     except ValueError as exc:
         return ApplyResult(False, str(exc), "", error=str(exc))
 
-    warning = admin_session_warning(request, rules)
-    if warning and not request.data.get("confirm_admin_lockout"):
+    warning = ""
+    if firewall_enabled and mode == "enforce":
+        warning = admin_session_warning(request, rules)
+        if default_action in BLOCKING_ACTIONS:
+            warning = warning or "Действието по подразбиране може да прекъсне административния достъп. Проверете разрешаващите правила."
+    if warning and request.data.get("confirm_admin_lockout") is not True:
         return ApplyResult(False, warning, config, warning=warning, error=warning)
 
     ok, message = apply_nft_config(config)

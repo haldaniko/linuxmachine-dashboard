@@ -3,15 +3,18 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test:ui": "playwright test",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
+    "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "lucide-react": "latest",
-    "recharts": "latest"
+    "recharts": "latest",
+    "vite": "latest"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@playwright/test": "^1.64.1"
+  }
 }

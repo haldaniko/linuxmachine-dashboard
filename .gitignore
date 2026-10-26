@@ -20,6 +20,8 @@ dist/
 frontend/dist/
 build/
 .vite/
+frontend/test-results/
+frontend/playwright-report/
 
 # Local tooling and OS files
 .tmp_pydeps/

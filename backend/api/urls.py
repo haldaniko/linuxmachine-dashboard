@@ -66,6 +66,7 @@ from .views import (
     siem_ingest_log,
     access_evaluate,
     users_manage,
+    user_update,
     web_filter_evaluate,
     web_filter_check,
 )
@@ -98,6 +99,7 @@ urlpatterns = [
     path("auth/logout/", auth_logout, name="auth-logout"),
     path("auth/me/", auth_me, name="auth-me"),
     path("auth/users/", users_manage, name="auth-users"),
+    path("auth/users/<int:user_id>/", user_update, name="auth-user-update"),
     path("dashboard/overview/", dashboard_overview, name="dashboard-overview"),
     path("firewall/status/", firewall_status, name="firewall-status"),
     path("firewall/apply/", firewall_apply, name="firewall-apply"),

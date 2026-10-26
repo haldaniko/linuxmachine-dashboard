@@ -1,12 +1,16 @@
 import ipaddress
 import json
 import re
+import shutil
 from datetime import timedelta
 from urllib.parse import urlparse
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
-from django.db.models import Count, Max, Q, Sum
+from django.db import transaction
+from django.db.models import Count, F, Max, Q, Sum
+from django.shortcuts import get_object_or_404
+from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action, api_view
@@ -17,6 +21,7 @@ from rest_framework.response import Response
 
 from .firewall_service import apply_firewall_rules, build_nft_config
 from .crowdsec_service import collect_cscli_metrics
+from .configuration import EDRSettingsSerializer
 from .models import (
     AccessControlRule,
     AccessPolicy,
@@ -43,6 +48,7 @@ from .models import (
 )
 from .serializers import (
     AccessControlRuleSerializer,
+    AccessEvaluationSerializer,
     AccessPolicySerializer,
     AlertSerializer,
     CorrelationRuleSerializer,
@@ -53,6 +59,7 @@ from .serializers import (
     EDRVulnerabilitySerializer,
     EndpointAssetSerializer,
     FirewallRuleSerializer,
+    FirewallEvaluationSerializer,
     IPSAlertSerializer,
     IPSCustomRuleSerializer,
     IPSRuleSerializer,
@@ -66,8 +73,9 @@ from .serializers import (
     UserCreateSerializer,
     UserSerializer,
     WebFilterRuleSerializer,
+    WebEvaluationSerializer,
 )
-from .edr_service import block_event_ip, create_event as create_edr_event, generate_enrollment, get_edr_setting, upsert_endpoint, upsert_vulnerability
+from .edr_service import block_event_ip, create_event as create_edr_event, generate_enrollment, get_edr_setting, upsert_endpoint, upsert_vulnerability, with_effective_status
 from .suricata_event_service import import_eve_file
 from .suricata_service import (
     apply_settings as apply_ips_settings,
@@ -128,6 +136,8 @@ def auth_login(request):
     user = authenticate(request, username=username, password=password)
     if not user or not user.is_active:
         return Response({"error": "Невалидно потребителско име или парола"}, status=status.HTTP_400_BAD_REQUEST)
+    user.last_login = timezone.now()
+    user.save(update_fields=["last_login"])
     token, _ = Token.objects.get_or_create(user=user)
     return Response({"token": token.key, "user": UserSerializer(user).data})
 
@@ -145,6 +155,8 @@ def auth_me(request):
 
 @api_view(["GET", "POST"])
 def users_manage(request):
+    if not request.user.is_staff:
+        return Response({"error": "Само администратор може да управлява потребители."}, status=status.HTTP_403_FORBIDDEN)
     if request.method == "GET":
         return Response(UserSerializer(User.objects.order_by("username"), many=True).data)
     if not request.user.is_staff:
@@ -153,6 +165,30 @@ def users_manage(request):
     serializer.is_valid(raise_exception=True)
     user = serializer.save()
     return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["PATCH"])
+def user_update(request, user_id):
+    if not request.user.is_staff:
+        return Response({"error": "Само администратор може да редактира потребители."}, status=status.HTTP_403_FORBIDDEN)
+    with transaction.atomic():
+        # Lock administrators together so concurrent edits cannot remove the last one.
+        list(User.objects.select_for_update().filter(is_staff=True, is_active=True).values_list("id", flat=True))
+        user = get_object_or_404(User.objects.select_for_update(), pk=user_id)
+        if user.is_superuser and not request.user.is_superuser:
+            return Response({"error": "Само суперпотребител може да редактира този профил."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = UserCreateSerializer(user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        active = serializer.validated_data.get("is_active", user.is_active)
+        staff = serializer.validated_data.get("is_staff", user.is_staff)
+        if user.pk == request.user.pk and (not active or not staff):
+            return Response({"error": "Не можете да деактивирате собствения си профил или да премахнете администраторските си права."}, status=status.HTTP_400_BAD_REQUEST)
+        if user.is_active and user.is_staff and (not active or not staff) and not User.objects.filter(is_active=True, is_staff=True).exclude(pk=user.pk).exists():
+            return Response({"error": "Трябва да остане поне един активен администратор."}, status=status.HTTP_400_BAD_REQUEST)
+        user = serializer.save()
+        if not active or "password" in serializer.validated_data:
+            Token.objects.filter(user=user).delete()
+    return Response(UserSerializer(user).data)
 
 
 def ensure_component(component_key):
@@ -182,9 +218,8 @@ def normalize_component(value, default=SecurityComponent.Category.SIEM):
 
 
 def bump_rule(rule):
-    rule.hit_count += 1
-    rule.last_matched = timezone.now()
-    rule.save(update_fields=["hit_count", "last_matched"])
+    type(rule).objects.filter(pk=rule.pk).update(hit_count=F("hit_count") + 1, last_matched=timezone.now())
+    rule.refresh_from_db(fields=["hit_count", "last_matched"])
 
 
 def record_event(component_key, source_ip, destination, event_type, severity, message, action=None, parsed=None):
@@ -278,20 +313,29 @@ def firewall_rule_matches(rule, payload):
 
 def evaluate_firewall_payload(payload, persist=False):
     matched_rule = None
-    action = ModuleSetting.objects.filter(key=SecurityComponent.Category.FIREWALL).first()
-    default_action = (action.settings.get("default_action") if action else "allow") or "allow"
+    setting = ModuleSetting.objects.filter(key=SecurityComponent.Category.FIREWALL).first()
+    default_action = (setting.settings.get("default_action") if setting else "allow") or "allow"
 
     for rule in FirewallRule.objects.filter(enabled=True).order_by("priority", "id"):
         if firewall_rule_matches(rule, payload):
             matched_rule = rule
-            bump_rule(rule)
+            if persist:
+                bump_rule(rule)
             break
 
-    result_action = matched_rule.action if matched_rule else default_action
+    policy_action = matched_rule.action if matched_rule else default_action
+    module_enabled = setting.enabled if setting else True
+    mode = setting.mode if setting else "enforce"
+    result_action = policy_action
+    reason = "matched_rule" if matched_rule else "default_policy"
+    if not module_enabled or mode == "disabled":
+        result_action, reason = "allow", "module_disabled"
+    elif mode == "monitor":
+        result_action, reason = "allow", "monitor_only"
     severity = "medium" if result_action in BLOCKING_ACTIONS else "low"
     destination = payload.get("destination") or payload.get("destination_ip") or ""
 
-    if persist:
+    if persist and module_enabled and mode != "disabled" and (policy_action != "allow" or (setting.settings if setting else {}).get("log_allowed", True)):
         record_event(
             SecurityComponent.Category.FIREWALL,
             payload.get("source_ip"),
@@ -311,12 +355,20 @@ def evaluate_firewall_payload(payload, persist=False):
         "action": result_action,
         "matched_rule": FirewallRuleSerializer(matched_rule).data if matched_rule else None,
         "default_action": default_action,
+        "policy_action": policy_action,
+        "module_enabled": module_enabled,
+        "mode": mode,
+        "reason": reason,
     }
 
 
 def web_rule_matches(rule, url):
     parsed = urlparse(url if "://" in url else f"http://{url}")
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
     normalized_url = url.lower()
     pattern = rule.pattern.lower()
     if rule.match_type == WebFilterRule.MatchType.DOMAIN:
@@ -338,13 +390,22 @@ def evaluate_web_payload(payload, persist=False):
     for rule in WebFilterRule.objects.filter(enabled=True).order_by("priority", "id"):
         if web_rule_matches(rule, url):
             matched_rule = rule
-            bump_rule(rule)
+            if persist:
+                bump_rule(rule)
             break
 
-    result_action = matched_rule.action if matched_rule else default_action
+    policy_action = matched_rule.action if matched_rule else default_action
+    module_enabled = setting.enabled if setting else True
+    mode = setting.mode if setting else "enforce"
+    reason = "matched_rule" if matched_rule else "default_policy"
+    result_action = policy_action
+    if not module_enabled or mode == "disabled":
+        result_action, reason = "allow", "module_disabled"
+    elif mode == "monitor":
+        result_action, reason = "allow", "monitor_only"
     severity = "medium" if result_action in {"block", "review"} else "low"
 
-    if persist:
+    if persist and module_enabled and mode != "disabled" and (policy_action != "allow" or (setting.settings if setting else {}).get("log_allowed", False)):
         record_event(
             SecurityComponent.Category.WEB_FILTER,
             payload.get("source_ip"),
@@ -361,6 +422,10 @@ def evaluate_web_payload(payload, persist=False):
         "category": matched_rule.category if matched_rule else "",
         "matched_rule": WebFilterRuleSerializer(matched_rule).data if matched_rule else None,
         "default_action": default_action,
+        "policy_action": policy_action,
+        "module_enabled": module_enabled,
+        "mode": mode,
+        "reason": reason,
     }
 
 
@@ -398,8 +463,10 @@ def inspect_ips_payload(payload, persist=True):
             final_action,
             payload,
         )
-    else:
+    elif persist:
         ensure_component(SecurityComponent.Category.IPS)
+        event = None
+    else:
         event = None
 
     return {
@@ -429,7 +496,8 @@ def evaluate_access_payload(payload, persist=False):
     for rule in AccessControlRule.objects.filter(enabled=True).order_by("priority", "id"):
         if access_rule_matches(rule, payload):
             matched_rule = rule
-            bump_rule(rule)
+            if persist:
+                bump_rule(rule)
             break
 
     effect = matched_rule.effect if matched_rule else default_effect
@@ -438,8 +506,17 @@ def evaluate_access_payload(payload, persist=False):
     if mfa_required and not mfa_verified:
         effect = "deny"
 
+    policy_effect = effect
+    module_enabled = setting.enabled if setting else True
+    mode = setting.mode if setting else "enforce"
+    reason = "mfa_required" if mfa_required and not mfa_verified else ("matched_rule" if matched_rule else "default_policy")
+    if not module_enabled or mode == "disabled":
+        effect, reason = "allow", "module_disabled"
+    elif mode == "monitor":
+        effect, reason = "allow", "monitor_only"
+
     severity = "high" if effect == "deny" else ("medium" if effect == "review" else "low")
-    if persist:
+    if persist and module_enabled and mode != "disabled":
         record_event(
             SecurityComponent.Category.ACCESS,
             payload.get("source_ip"),
@@ -457,6 +534,10 @@ def evaluate_access_payload(payload, persist=False):
         "mfa_verified": mfa_verified,
         "matched_rule": AccessControlRuleSerializer(matched_rule).data if matched_rule else None,
         "default_effect": default_effect,
+        "policy_effect": policy_effect,
+        "module_enabled": module_enabled,
+        "mode": mode,
+        "reason": reason,
     }
 
 
@@ -625,7 +706,7 @@ class EDREndpointViewSet(viewsets.ModelViewSet):
     ordering_fields = ["hostname", "status", "security_status", "last_seen"]
 
     def get_queryset(self):
-        return EDREndpoint.objects.annotate(threats_count=Count("threats"), vulnerabilities_count=Count("vulnerabilities"))
+        return with_effective_status(EDREndpoint.objects.all()).annotate(threats_count=Count("threats", distinct=True), vulnerabilities_count=Count("vulnerabilities", distinct=True)).order_by("hostname", "id")
 
 
 class EDREventViewSet(viewsets.ReadOnlyModelViewSet):
@@ -674,6 +755,11 @@ class SecurityEventViewSet(viewsets.ModelViewSet):
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["source_ip", "destination", "event_type", "message", "severity", "status"]
     ordering_fields = ["occurred_at", "severity", "status"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        component = self.request.query_params.get("component__category")
+        return queryset.filter(component__category=component) if component else queryset
 
 
 class AlertViewSet(viewsets.ModelViewSet):
@@ -781,7 +867,9 @@ def dashboard_overview(request):
 
 @api_view(["POST"])
 def firewall_evaluate(request):
-    return Response(evaluate_firewall_payload(request.data, persist=False))
+    serializer = FirewallEvaluationSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    return Response(evaluate_firewall_payload(serializer.validated_data, persist=False))
 
 
 @api_view(["POST"])
@@ -810,8 +898,15 @@ def firewall_status(request):
     setting = get_firewall_setting()
     rules = FirewallRule.objects.all()
     last_rule_update = rules.aggregate(value=Max("updated_at"))["value"]
-    last_apply = rules.exclude(applied_at=None).aggregate(value=Max("applied_at"))["value"]
+    saved_apply = (setting.settings or {}).get("last_applied_at")
+    last_apply = parse_datetime(saved_apply) if isinstance(saved_apply, str) else None
+    last_apply = last_apply or rules.exclude(applied_at=None).aggregate(value=Max("applied_at"))["value"]
     has_unapplied = rules.filter(Q(applied_at=None) | Q(updated_at__gt=last_apply)).exists() if last_apply else rules.exists()
+    if last_apply and setting.updated_at > last_apply:
+        has_unapplied = True
+    applied_ids = (setting.settings or {}).get("applied_rule_ids")
+    if applied_ids is not None and applied_ids != list(rules.order_by("id").values_list("id", flat=True)):
+        has_unapplied = True
     blocked_events = SecurityEvent.objects.filter(
         component__category=SecurityComponent.Category.FIREWALL,
         occurred_at__gte=day_ago,
@@ -821,12 +916,17 @@ def firewall_status(request):
         {
             "enabled": setting.enabled,
             "backend": "nftables",
+            "mode": setting.mode,
+            "default_action": (setting.settings or {}).get("default_action", "allow"),
             "active_rules": rules.filter(enabled=True).count(),
             "blocked_24h": blocked_events,
             "last_rule_update": last_rule_update,
             "last_apply": last_apply,
             "has_unapplied_changes": has_unapplied,
             "table": "inet security_platform",
+            "runtime_available": bool(shutil.which("nft")),
+            "runtime_message": "nftables е наличен" if shutil.which("nft") else "nftables не е наличен в средата на сървъра",
+            "settings_updated_at": setting.updated_at,
         }
     )
 
@@ -835,10 +935,16 @@ def firewall_status(request):
 def firewall_apply(request):
     setting = get_firewall_setting()
     rules = FirewallRule.objects.filter(enabled=True).order_by("priority", "id")
-    result = apply_firewall_rules(request, rules, firewall_enabled=setting.enabled)
+    result = apply_firewall_rules(
+        request, rules, firewall_enabled=setting.enabled, mode=setting.mode,
+        default_action=(setting.settings or {}).get("default_action", "allow"),
+        log_allowed=(setting.settings or {}).get("log_allowed", True),
+    )
     now = timezone.now()
     if result.ok:
         FirewallRule.objects.update(applied_at=now, apply_error="")
+        setting.settings = {**(setting.settings or {}), "last_applied_at": now.isoformat(), "applied_rule_ids": list(FirewallRule.objects.order_by("id").values_list("id", flat=True))}
+        ModuleSetting.objects.filter(pk=setting.pk).update(settings=setting.settings, updated_at=now)
         SecurityComponent.objects.filter(category=SecurityComponent.Category.FIREWALL).update(last_checked=now)
     else:
         FirewallRule.objects.update(apply_error=result.error)
@@ -874,7 +980,11 @@ def firewall_enable(request):
     setting = get_firewall_setting()
     setting.enabled = True
     setting.save(update_fields=["enabled", "updated_at"])
-    config = build_nft_config(FirewallRule.objects.filter(enabled=True).order_by("priority", "id"), firewall_enabled=True)
+    config = build_nft_config(
+        FirewallRule.objects.filter(enabled=True).order_by("priority", "id"), firewall_enabled=True,
+        mode=setting.mode, default_action=(setting.settings or {}).get("default_action", "allow"),
+        log_allowed=(setting.settings or {}).get("log_allowed", True),
+    )
     return Response({"enabled": True, "backend": "nftables", "config": config})
 
 
@@ -889,12 +999,16 @@ def firewall_disable(request):
 
 @api_view(["POST"])
 def web_filter_check(request):
-    return Response(evaluate_web_payload(request.data, persist=True), status=status.HTTP_201_CREATED)
+    serializer = WebEvaluationSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    return Response(evaluate_web_payload(serializer.validated_data, persist=True), status=status.HTTP_201_CREATED)
 
 
 @api_view(["POST"])
 def web_filter_evaluate(request):
-    return Response(evaluate_web_payload(request.data, persist=False))
+    serializer = WebEvaluationSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    return Response(evaluate_web_payload(serializer.validated_data, persist=False))
 
 
 @api_view(["POST"])
@@ -956,7 +1070,7 @@ def ips_events(request):
 
 @api_view(["GET"])
 def ips_event_detail(request, event_id):
-    alert = IPSAlert.objects.get(id=event_id)
+    alert = get_object_or_404(IPSAlert, id=event_id)
     return Response(IPSAlertSerializer(alert).data)
 
 
@@ -1018,7 +1132,7 @@ def ips_update_rules(request):
 
 @api_view(["POST"])
 def ips_block_source(request, event_id):
-    alert = IPSAlert.objects.get(id=event_id)
+    alert = get_object_or_404(IPSAlert, id=event_id)
     ip = ipaddress.ip_address(alert.source_ip)
     if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
         return Response({"error": "Этот адрес нельзя автоматически заблокировать из IPS-события"}, status=status.HTTP_400_BAD_REQUEST)
@@ -1103,16 +1217,16 @@ def edr_status(request):
     now = timezone.now()
     day_ago = now - timedelta(hours=24)
     setting = get_edr_setting()
-    endpoints = EDREndpoint.objects.all()
+    endpoints = with_effective_status(EDREndpoint.objects.all())
     events_24h = EDREvent.objects.filter(timestamp__gte=day_ago)
     return Response(
         {
             "enabled": setting.enabled,
             "provider": (setting.settings or {}).get("provider", "wazuh"),
             "endpoints": endpoints.count(),
-            "online": endpoints.filter(status=EDREndpoint.AgentStatus.ONLINE).count(),
-            "offline": endpoints.filter(status=EDREndpoint.AgentStatus.OFFLINE).count(),
-            "never_connected": endpoints.filter(status=EDREndpoint.AgentStatus.NEVER_CONNECTED).count(),
+            "online": endpoints.filter(effective_status=EDREndpoint.AgentStatus.ONLINE).count(),
+            "offline": endpoints.filter(effective_status=EDREndpoint.AgentStatus.OFFLINE).count(),
+            "never_connected": endpoints.filter(effective_status=EDREndpoint.AgentStatus.NEVER_CONNECTED).count(),
             "threats_24h": EDRThreat.objects.filter(created_at__gte=day_ago).count(),
             "critical_24h": events_24h.filter(severity="critical").count(),
             "high_24h": events_24h.filter(severity="high").count(),
@@ -1129,11 +1243,13 @@ def edr_crowdsec_metrics(request):
 
 @api_view(["GET"])
 def edr_endpoint_events(request, endpoint_id):
+    get_object_or_404(EDREndpoint, pk=endpoint_id)
     return Response(EDREventSerializer(EDREvent.objects.filter(endpoint_id=endpoint_id).order_by("-timestamp")[:1000], many=True).data)
 
 
 @api_view(["GET"])
 def edr_endpoint_vulnerabilities(request, endpoint_id):
+    get_object_or_404(EDREndpoint, pk=endpoint_id)
     return Response(EDRVulnerabilitySerializer(EDRVulnerability.objects.filter(endpoint_id=endpoint_id), many=True).data)
 
 
@@ -1192,7 +1308,7 @@ def edr_events(request):
 
 @api_view(["GET"])
 def edr_event_detail(request, event_id):
-    return Response(EDREventSerializer(EDREvent.objects.get(id=event_id)).data)
+    return Response(EDREventSerializer(get_object_or_404(EDREvent, id=event_id)).data)
 
 
 @api_view(["GET"])
@@ -1202,7 +1318,7 @@ def edr_threats(request):
 
 @api_view(["PUT"])
 def edr_threat_status(request, threat_id):
-    threat = EDRThreat.objects.get(id=threat_id)
+    threat = get_object_or_404(EDRThreat, id=threat_id)
     new_status = request.data.get("status")
     if new_status not in dict(EDRThreat.Status.choices):
         return Response({"error": "Некорректный статус угрозы"}, status=status.HTTP_400_BAD_REQUEST)
@@ -1213,7 +1329,7 @@ def edr_threat_status(request, threat_id):
 
 @api_view(["POST"])
 def edr_event_block_ip(request, event_id):
-    event = EDREvent.objects.get(id=event_id)
+    event = get_object_or_404(EDREvent, id=event_id)
     try:
         rule = block_event_ip(event)
     except ValueError as exc:
@@ -1235,7 +1351,9 @@ def edr_install_windows(request):
 def edr_settings(request):
     setting = get_edr_setting()
     if request.method == "PUT":
-        payload = request.data
+        serializer = EDRSettingsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
         current = setting.settings or {}
         setting.enabled = bool(payload.get("enabled", setting.enabled))
         setting.settings = {
@@ -1247,17 +1365,28 @@ def edr_settings(request):
             "automatic_refresh": bool(payload.get("automatic_refresh", current.get("automatic_refresh", True))),
         }
         setting.save(update_fields=["enabled", "settings", "updated_at"])
-    return Response(ModuleSettingSerializer(setting).data)
+    payload = ModuleSettingSerializer(setting).data
+    payload["capabilities"] = {
+        "offline_timeout": True,
+        "retention_cleanup": False,
+        "agent_policy_deployment": False,
+        "enrollment_token_verification": False,
+    }
+    return Response(payload)
 
 
 @api_view(["POST"])
 def access_check(request):
-    return Response(evaluate_access_payload(request.data, persist=True), status=status.HTTP_201_CREATED)
+    serializer = AccessEvaluationSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    return Response(evaluate_access_payload(serializer.validated_data, persist=True), status=status.HTTP_201_CREATED)
 
 
 @api_view(["POST"])
 def access_evaluate(request):
-    return Response(evaluate_access_payload(request.data, persist=False))
+    serializer = AccessEvaluationSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    return Response(evaluate_access_payload(serializer.validated_data, persist=False))
 
 
 @api_view(["POST"])
